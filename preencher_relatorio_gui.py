@@ -1,11 +1,8 @@
-
 #!/usr/bin/env python3
 """
 preencher_relatorio_gui.py
-
 Versão robusta do gerador de relatórios com fallback para CLI quando o Tkinter
 não estiver disponível (resolve ModuleNotFoundError: No module named 'tkinter').
-
 Funcionalidades:
 - Consulta ReceitaWS por CNPJ
 - Preenche placeholders em template .docx
@@ -15,9 +12,7 @@ Funcionalidades:
 - Argumentos de linha de comando para rodar em modo não-GUI
 - Testes unitários simples acessíveis via --run-tests
 """
-
 from __future__ import annotations
-
 import re
 import os
 import time
@@ -27,7 +22,6 @@ import argparse
 import requests
 from pathlib import Path
 from typing import Dict, Optional
-
 # tenta importar tkinter dinamicamente (alguns ambientes não têm suporte)
 try:
     import tkinter as tk
@@ -38,18 +32,15 @@ except Exception:
     tk = None
     filedialog = None
     messagebox = None
-
 # docx (necessário instalar python-docx)
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
-
 # ----------------- Configuração -----------------
 RECEITAWS_URL = "https://www.receitaws.com.br/v1/cnpj/{}"
 REQUEST_TIMEOUT = 10
 PLACEHOLDER_PATTERN = re.compile(r'\[([A-Z0-9_]+)\]')
-
 # ----------------- Utilitários -----------------
 def normalize_cnpj(cnpj_raw: str) -> str:
     digits = re.sub(r'\D', '', cnpj_raw or '')
@@ -94,13 +85,11 @@ def build_mapping(data: dict) -> dict:
             atividade_principal = data["atividade_principal"][0].get("text", "")
         except Exception:
             atividade_principal = str(data.get("atividade_principal"))
-
     resumo = " | ".join(filter(None, [
         atividade_principal,
         safe_get("porte"),
         safe_get("situacao")
     ]))
-
     endereco = " - ".join(filter(None, [
         safe_get("logradouro"),
         safe_get("numero"),
@@ -109,7 +98,6 @@ def build_mapping(data: dict) -> dict:
         safe_get("uf"),
         safe_get("cep"),
     ]))
-
     mapping = {
         "NOME_EMPRESA_CLIENTE": safe_get("nome"),
         "FANTASIA": safe_get("fantasia"),
@@ -124,6 +112,13 @@ def build_mapping(data: dict) -> dict:
         "OBJETIVO_EMPRESA": "",
         "LINK_DRIVE": "",
         "LINK_DRIVE_TEXT": "",
+        "DATA_BACKUP": "",
+        "DATA_KICKOFF": "",
+        "DATA_ENTREGA": "",
+        "DOMINIO": "",
+        "DEMANDA": "",
+        "DOMINIOWP": "",
+        "ESPECIALISTARESPONSAVEL": "",
     }
     return mapping
 
@@ -188,9 +183,8 @@ class OpenAIProvider(AIProviderBase):
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY não configurada.")
         try:
-            import openai
-            openai.api_key = self.api_key
-            self.openai = openai
+            from openai import OpenAI
+            self.client = OpenAI(api_key=self.api_key)
         except Exception as e:
             raise RuntimeError("Biblioteca openai não instalada. pip install openai") from e
 
@@ -200,19 +194,14 @@ class OpenAIProvider(AIProviderBase):
             "informações abaixo. Use linguagem formal e direta. Retorne apenas o texto.\n\n"
             f"INFORMAÇÕES:\n{source_text}\n"
         )
-        resp = self.openai.ChatCompletion.create(
+        resp = self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=256,
             temperature=0.2,
         )
-        choices = resp.get("choices") if isinstance(resp, dict) else None
-        if choices and isinstance(choices, list) and choices:
-            msg = choices[0].get("message") or choices[0]
-            content = (msg.get("content") if isinstance(msg, dict) else str(msg))
-            return (content or "").strip()
-        text = getattr(resp, "text", None) or str(resp)
-        return (text or "").strip()
+        content = resp.choices[0].message.content.strip()
+        return content
 
 def get_ai_provider(name: Optional[str]) -> AIProviderBase:
     name = (name or "mock").lower()
@@ -248,31 +237,46 @@ def add_hyperlink(paragraph, url: str, text: str):
 
 def replace_in_paragraph(paragraph, mapping: Dict[str, str]):
     full_text = "".join([r.text for r in paragraph.runs])
-    if not full_text:
-        return
     if "[LINK_DRIVE]" in full_text and mapping.get("LINK_DRIVE"):
+        # Special handling for hyperlink: rebuild paragraph parts while replacing other placeholders
         parts = full_text.split("[LINK_DRIVE]")
-        for i in range(len(paragraph.runs)-1, -1, -1):
+        # Clear all runs
+        for i in range(len(paragraph.runs) - 1, -1, -1):
             paragraph._element.remove(paragraph.runs[i]._element)
         for idx, part in enumerate(parts):
+            # Replace other placeholders in this part
             for key, val in mapping.items():
-                if key in ("LINK_DRIVE","LINK_DRIVE_TEXT"):
-                    continue
-                part = part.replace(f'[{key}]', val or "")
+                if key not in ("LINK_DRIVE", "LINK_DRIVE_TEXT"):
+                    part = part.replace(f'[{key}]', val or "")
             if part:
                 paragraph.add_run(part)
-            if idx < len(parts)-1:
+            if idx < len(parts) - 1:
                 display = mapping.get("LINK_DRIVE_TEXT") or "Link Drive"
                 add_hyperlink(paragraph, mapping["LINK_DRIVE"], display)
         return
-    new_text = full_text
-    for key, val in mapping.items():
-        if key in ("LINK_DRIVE","LINK_DRIVE_TEXT"):
-            continue
-        new_text = new_text.replace(f'[{key}]', val or "")
-    for i in range(len(paragraph.runs)-1, -1, -1):
-        paragraph._element.remove(paragraph.runs[i]._element)
-    paragraph.add_run(new_text)
+
+    # Normal case: per-run replacement to preserve formatting
+    non_link_keys = {k: v for k, v in mapping.items() if k not in ("LINK_DRIVE", "LINK_DRIVE_TEXT")}
+    for run in paragraph.runs:
+        text = run.text
+        for key, val in non_link_keys.items():
+            text = text.replace(f'[{key}]', val or "")
+        run.text = text
+
+    # Check for remaining placeholders (spanning runs)
+    new_full_text = "".join([r.text for r in paragraph.runs])
+    remaining = PLACEHOLDER_PATTERN.findall(new_full_text)
+    if remaining:
+        # Fallback: rebuild with single run (loses formatting for spanning parts)
+        new_text = new_full_text
+        for key, val in non_link_keys.items():
+            new_text = new_text.replace(f'[{key}]', val or "")
+        # Clear runs
+        for i in range(len(paragraph.runs) - 1, -1, -1):
+            paragraph._element.remove(paragraph.runs[i]._element)
+        # Add new run
+        paragraph.add_run(new_text)
+        print(f"Warning: Rebuilt paragraph due to spanning placeholders: {remaining}", file=sys.stderr)
 
 def replace_in_table(table, mapping: Dict[str, str]):
     for row in table.rows:
@@ -295,10 +299,21 @@ def process_document(template_path: str, output_path: str, mapping: Dict[str, st
             replace_in_block(section.footer, mapping)
     doc.save(output_path)
 
+def fix_docx_templates():
+    """Fix para PyInstaller não incluir templates docx"""
+    import sys
+    import os
+    if hasattr(sys, '_MEIPASS'):
+        # Estamos executando via PyInstaller
+        import docx
+        template_dir = os.path.join(sys._MEIPASS, 'docx', 'templates')
+        if os.path.exists(template_dir):
+            docx.shared.TEMPLATE_DIR = template_dir
+
 # ----------------- CLI flow -----------------
 def run_cli(template: Optional[str] = None, cnpj: Optional[str] = None, drive: Optional[str] = None,
             drive_text: Optional[str] = None, use_ai: Optional[bool] = None, ai_provider: Optional[str] = None,
-            out: Optional[str] = None) -> None:
+            out: Optional[str] = None, extra_mapping: Optional[dict] = None) -> None:
     try:
         if not template:
             template = input("Caminho do template .docx: ").strip()
@@ -322,6 +337,23 @@ def run_cli(template: Optional[str] = None, cnpj: Optional[str] = None, drive: O
                 drive = "https://" + drive
             mapping["LINK_DRIVE"] = drive
             mapping["LINK_DRIVE_TEXT"] = drive_text or input("Texto do link (ENTER para 'Link Drive'): ").strip() or "Link Drive"
+
+        # Handle extra fields
+        extra_fields = {
+            "DATA_BACKUP": "Data Backup (opcional): ",
+            "DATA_KICKOFF": "Data Kickoff (opcional): ",
+            "DATA_ENTREGA": "Data Entrega (opcional): ",
+            "DOMINIO": "Domínio (opcional): ",
+            "DEMANDA": "Demanda (opcional): ",
+            "DOMINIOWP": "Domínio WP (opcional): ",
+            "ESPECIALISTARESPONSAVEL": "Especialista Responsável (opcional): ",
+        }
+        for field, prompt in extra_fields.items():
+            value = extra_mapping.get(field, "") if extra_mapping else ""
+            if not value:
+                value = input(prompt).strip()
+            mapping[field] = value
+
         if use_ai is None:
             use_ai = input("Deseja usar IA para preencher [OBJETIVO_EMPRESA]? (s/N): ").strip().lower() == 's'
         if use_ai:
@@ -359,21 +391,17 @@ if TKINTER_AVAILABLE:
         def __init__(self, root):
             self.root = root
             root.title("Gerador de Relatório - CNPJ -> Word")
-
             frm = tk.Frame(root, padx=10, pady=10)
             frm.pack(fill=tk.BOTH, expand=True)
-
             # Template
             tk.Label(frm, text="Template (.docx):").grid(row=0, column=0, sticky='w')
             self.entry_template = tk.Entry(frm, width=60)
             self.entry_template.grid(row=0, column=1, sticky='w')
             tk.Button(frm, text="Abrir", command=self.browse_template).grid(row=0, column=2)
-
             # CNPJ
             tk.Label(frm, text="CNPJ da empresa:").grid(row=1, column=0, sticky='w', pady=(10,0))
             self.entry_cnpj = tk.Entry(frm, width=40)
             self.entry_cnpj.grid(row=1, column=1, sticky='w', pady=(10,0))
-
             # Link Drive
             tk.Label(frm, text="Link do Drive (opcional):").grid(row=2, column=0, sticky='w')
             self.entry_drive = tk.Entry(frm, width=60)
@@ -381,23 +409,34 @@ if TKINTER_AVAILABLE:
             tk.Label(frm, text="Texto do Link:").grid(row=2, column=2, sticky='w')
             self.entry_drive_text = tk.Entry(frm, width=20)
             self.entry_drive_text.grid(row=2, column=3, sticky='w')
-
+            # Extra fields
+            tk.Label(frm, text="Data Backup:").grid(row=3, column=0, sticky='w')
+            self.entry_data_backup = tk.Entry(frm, width=20); self.entry_data_backup.grid(row=3, column=1, sticky='w')
+            tk.Label(frm, text="Data Kickoff:").grid(row=4, column=0, sticky='w')
+            self.entry_data_kickoff = tk.Entry(frm, width=20); self.entry_data_kickoff.grid(row=4, column=1, sticky='w')
+            tk.Label(frm, text="Data Entrega:").grid(row=5, column=0, sticky='w')
+            self.entry_data_entrega = tk.Entry(frm, width=20); self.entry_data_entrega.grid(row=5, column=1, sticky='w')
+            tk.Label(frm, text="Domínio:").grid(row=6, column=0, sticky='w')
+            self.entry_dominio = tk.Entry(frm, width=40); self.entry_dominio.grid(row=6, column=1, sticky='w')
+            tk.Label(frm, text="Demanda:").grid(row=7, column=0, sticky='w')
+            self.entry_demanda = tk.Entry(frm, width=40); self.entry_demanda.grid(row=7, column=1, sticky='w')
+            tk.Label(frm, text="Domínio WP:").grid(row=8, column=0, sticky='w')
+            self.entry_dominiowp = tk.Entry(frm, width=40); self.entry_dominiowp.grid(row=8, column=1, sticky='w')
+            tk.Label(frm, text="Especialista Responsável:").grid(row=9, column=0, sticky='w')
+            self.entry_especialista = tk.Entry(frm, width=40); self.entry_especialista.grid(row=9, column=1, sticky='w')
             # IA
             self.use_ai_var = tk.IntVar(value=1)
-            tk.Checkbutton(frm, text="Usar IA para preencher [OBJETIVO_EMPRESA]", variable=self.use_ai_var).grid(row=3, column=1, sticky='w', pady=(10,0))
-
-            tk.Label(frm, text="Provedor IA:").grid(row=4, column=0, sticky='w', pady=(10,0))
+            tk.Checkbutton(frm, text="Usar IA para preencher [OBJETIVO_EMPRESA]", variable=self.use_ai_var).grid(row=10, column=0, sticky='w', columnspan=2, pady=(10,0))
+            tk.Label(frm, text="Provedor IA:").grid(row=11, column=0, sticky='w', pady=(10,0))
             self.ai_provider = tk.StringVar(value=os.environ.get('AI_PROVIDER', 'mock'))
-            tk.OptionMenu(frm, self.ai_provider, 'mock', 'hf', 'openai').grid(row=4, column=1, sticky='w')
-
+            tk.OptionMenu(frm, self.ai_provider, 'mock', 'hf', 'openai').grid(row=11, column=1, sticky='w')
             # Arquivo saída
-            tk.Label(frm, text="Arquivo saída (.docx):").grid(row=5, column=0, sticky='w', pady=(10,0))
+            tk.Label(frm, text="Arquivo saída (.docx):").grid(row=12, column=0, sticky='w', pady=(10,0))
             self.entry_out = tk.Entry(frm, width=60)
-            self.entry_out.grid(row=5, column=1, sticky='w')
+            self.entry_out.grid(row=12, column=1, sticky='w')
             self.entry_out.insert(0, 'relatorio_saida.docx')
-
             # Botão gerar
-            tk.Button(frm, text="Gerar Relatório", command=self.run).grid(row=6, column=1, pady=20)
+            tk.Button(frm, text="Gerar Relatório", command=self.run).grid(row=13, column=1, pady=20)
 
         def browse_template(self):
             p = filedialog.askopenfilename(filetypes=[('Word files', '*.docx')])
@@ -422,6 +461,13 @@ if TKINTER_AVAILABLE:
                 messagebox.showerror('Erro', f'Falha ao consultar ReceitaWS: {e}')
                 return
             mapping = build_mapping(data)
+            mapping["DATA_BACKUP"] = self.entry_data_backup.get().strip()
+            mapping["DATA_KICKOFF"] = self.entry_data_kickoff.get().strip()
+            mapping["DATA_ENTREGA"] = self.entry_data_entrega.get().strip()
+            mapping["DOMINIO"] = self.entry_dominio.get().strip()
+            mapping["DEMANDA"] = self.entry_demanda.get().strip()
+            mapping["DOMINIOWP"] = self.entry_dominiowp.get().strip()
+            mapping["ESPECIALISTARESPONSAVEL"] = self.entry_especialista.get().strip()
             drive = self.entry_drive.get().strip()
             if drive:
                 if not drive.startswith(('http://', 'https://')):
@@ -458,6 +504,7 @@ if TKINTER_AVAILABLE:
 
 # ----------------- Main -----------------
 def main():
+    fix_docx_templates()
     parser = argparse.ArgumentParser(description="Preencher relatórios Word via CNPJ")
     parser.add_argument("--template", help=".docx template")
     parser.add_argument("--cnpj", help="CNPJ da empresa")
@@ -466,6 +513,13 @@ def main():
     parser.add_argument("--use-ai", action="store_true", help="Usar IA para preencher [OBJETIVO_EMPRESA]")
     parser.add_argument("--ai-provider", help="Provedor IA: mock/hf/openai")
     parser.add_argument("--out", help="Arquivo de saída .docx")
+    parser.add_argument("--data-backup", help="Data de backup [DATA_BACKUP]")
+    parser.add_argument("--data-kickoff", help="Data de kickoff [DATA_KICKOFF]")
+    parser.add_argument("--data-entrega", help="Data de entrega [DATA_ENTREGA]")
+    parser.add_argument("--dominio", help="Texto [DOMINIO]")
+    parser.add_argument("--demanda", help="Texto [DEMANDA]")
+    parser.add_argument("--dominiowp", help="Texto [DOMINIOWP]")
+    parser.add_argument("--especialista-responsavel", help="Texto [ESPECIALISTARESPONSAVEL]")
     parser.add_argument("--run-tests", action="store_true", help="Executar testes rápidos")
     args = parser.parse_args()
     if args.run_tests:
@@ -491,6 +545,15 @@ def main():
         app = App(root)
         root.mainloop()
     else:
+        extra_mapping = {
+            "DATA_BACKUP": args.data_backup or "",
+            "DATA_KICKOFF": args.data_kickoff or "",
+            "DATA_ENTREGA": args.data_entrega or "",
+            "DOMINIO": args.dominio or "",
+            "DEMANDA": args.demanda or "",
+            "DOMINIOWP": args.dominiowp or "",
+            "ESPECIALISTARESPONSAVEL": args.especialista_responsavel or "",
+        }
         run_cli(
             template=args.template,
             cnpj=args.cnpj,
@@ -498,7 +561,8 @@ def main():
             drive_text=args.drive_text,
             use_ai=args.use_ai,
             ai_provider=args.ai_provider,
-            out=args.out
+            out=args.out,
+            extra_mapping=extra_mapping
         )
 
 if __name__ == "__main__":
