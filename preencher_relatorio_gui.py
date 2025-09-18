@@ -7,7 +7,7 @@ Funcionalidades:
 - Consulta ReceitaWS por CNPJ
 - Preenche placeholders em template .docx
 - Gera [OBJETIVO_EMPRESA] opcional via provedor de IA (pluggable)
-- Insere hyperlink para [LINK_DRIVE]
+- Insere hyperlink para [LINK_DRIVE] e [LINK_PARA_DOWNLOAD]
 - Modo GUI (Tkinter) quando disponível; caso contrário, modo CLI automático
 - Argumentos de linha de comando para rodar em modo não-GUI
 - Testes unitários simples acessíveis via --run-tests
@@ -112,13 +112,15 @@ def build_mapping(data: dict) -> dict:
         "OBJETIVO_EMPRESA": "",
         "LINK_DRIVE": "",
         "LINK_DRIVE_TEXT": "",
+        "LINK_PARA_DOWNLOAD": "",
+        "LINK_PARA_DOWNLOAD_TEXT": "",
         "DATA_BACKUP": "",
         "DATA_KICKOFF": "",
         "DATA_ENTREGA": "",
         "DOMINIO": "",
         "DEMANDA": "",
         "DOMINIOWP": "",
-        "ESPECIALISTARESPONSAVEL": "",
+        "ESPECIALISTARESPONSAVEL": "ITALO GOMES",
     }
     return mapping
 
@@ -237,17 +239,18 @@ def add_hyperlink(paragraph, url: str, text: str):
 
 def replace_in_paragraph(paragraph, mapping: Dict[str, str]):
     full_text = "".join([r.text for r in paragraph.runs])
+    non_link_keys = {k: v for k, v in mapping.items() if k not in ("LINK_DRIVE", "LINK_DRIVE_TEXT", "LINK_PARA_DOWNLOAD", "LINK_PARA_DOWNLOAD_TEXT")}
+
+    # Handle [LINK_DRIVE]
     if "[LINK_DRIVE]" in full_text and mapping.get("LINK_DRIVE"):
-        # Special handling for hyperlink: rebuild paragraph parts while replacing other placeholders
         parts = full_text.split("[LINK_DRIVE]")
         # Clear all runs
         for i in range(len(paragraph.runs) - 1, -1, -1):
             paragraph._element.remove(paragraph.runs[i]._element)
         for idx, part in enumerate(parts):
             # Replace other placeholders in this part
-            for key, val in mapping.items():
-                if key not in ("LINK_DRIVE", "LINK_DRIVE_TEXT"):
-                    part = part.replace(f'[{key}]', val or "")
+            for key, val in non_link_keys.items():
+                part = part.replace(f'[{key}]', val or "")
             if part:
                 paragraph.add_run(part)
             if idx < len(parts) - 1:
@@ -255,8 +258,24 @@ def replace_in_paragraph(paragraph, mapping: Dict[str, str]):
                 add_hyperlink(paragraph, mapping["LINK_DRIVE"], display)
         return
 
+    # Handle [LINK_PARA_DOWNLOAD]
+    if "[LINK_PARA_DOWNLOAD]" in full_text and mapping.get("LINK_PARA_DOWNLOAD"):
+        parts = full_text.split("[LINK_PARA_DOWNLOAD]")
+        # Clear all runs
+        for i in range(len(paragraph.runs) - 1, -1, -1):
+            paragraph._element.remove(paragraph.runs[i]._element)
+        for idx, part in enumerate(parts):
+            # Replace other placeholders in this part
+            for key, val in non_link_keys.items():
+                part = part.replace(f'[{key}]', val or "")
+            if part:
+                paragraph.add_run(part)
+            if idx < len(parts) - 1:
+                display = "Link para download"
+                add_hyperlink(paragraph, mapping["LINK_PARA_DOWNLOAD"], display)
+        return
+
     # Normal case: per-run replacement to preserve formatting
-    non_link_keys = {k: v for k, v in mapping.items() if k not in ("LINK_DRIVE", "LINK_DRIVE_TEXT")}
     for run in paragraph.runs:
         text = run.text
         for key, val in non_link_keys.items():
@@ -337,6 +356,8 @@ def run_cli(template: Optional[str] = None, cnpj: Optional[str] = None, drive: O
                 drive = "https://" + drive
             mapping["LINK_DRIVE"] = drive
             mapping["LINK_DRIVE_TEXT"] = drive_text or input("Texto do link (ENTER para 'Link Drive'): ").strip() or "Link Drive"
+            mapping["LINK_PARA_DOWNLOAD"] = drive
+            mapping["LINK_PARA_DOWNLOAD_TEXT"] = "Link para download"
 
         # Handle extra fields
         extra_fields = {
@@ -345,14 +366,21 @@ def run_cli(template: Optional[str] = None, cnpj: Optional[str] = None, drive: O
             "DATA_ENTREGA": "Data Entrega (opcional): ",
             "DOMINIO": "Domínio (opcional): ",
             "DEMANDA": "Demanda (opcional): ",
-            "DOMINIOWP": "Domínio WP (opcional): ",
-            "ESPECIALISTARESPONSAVEL": "Especialista Responsável (opcional): ",
         }
         for field, prompt in extra_fields.items():
             value = extra_mapping.get(field, "") if extra_mapping else ""
             if not value:
                 value = input(prompt).strip()
             mapping[field] = value
+
+        # Auto-set DOMINIOWP based on DOMINIO
+        if mapping.get("DOMINIO"):
+            mapping["DOMINIOWP"] = mapping["DOMINIO"] + "/wp-admin/"
+        else:
+            mapping["DOMINIOWP"] = ""
+
+        # ESPECIALISTARESPONSAVEL is always fixed
+        mapping["ESPECIALISTARESPONSAVEL"] = "ITALO GOMES"
 
         if use_ai is None:
             use_ai = input("Deseja usar IA para preencher [OBJETIVO_EMPRESA]? (s/N): ").strip().lower() == 's'
@@ -420,23 +448,24 @@ if TKINTER_AVAILABLE:
             self.entry_dominio = tk.Entry(frm, width=40); self.entry_dominio.grid(row=6, column=1, sticky='w')
             tk.Label(frm, text="Demanda:").grid(row=7, column=0, sticky='w')
             self.entry_demanda = tk.Entry(frm, width=40); self.entry_demanda.grid(row=7, column=1, sticky='w')
-            tk.Label(frm, text="Domínio WP:").grid(row=8, column=0, sticky='w')
-            self.entry_dominiowp = tk.Entry(frm, width=40); self.entry_dominiowp.grid(row=8, column=1, sticky='w')
-            tk.Label(frm, text="Especialista Responsável:").grid(row=9, column=0, sticky='w')
-            self.entry_especialista = tk.Entry(frm, width=40); self.entry_especialista.grid(row=9, column=1, sticky='w')
+            # Removed DOMINIOWP entry - auto-generated
+            tk.Label(frm, text="Especialista Responsável:").grid(row=8, column=0, sticky='w')
+            self.entry_especialista = tk.Entry(frm, width=40); self.entry_especialista.grid(row=8, column=1, sticky='w')
+            self.entry_especialista.insert(0, "ITALO GOMES")
+            self.entry_especialista.config(state="readonly")  # Make it read-only
             # IA
             self.use_ai_var = tk.IntVar(value=1)
-            tk.Checkbutton(frm, text="Usar IA para preencher [OBJETIVO_EMPRESA]", variable=self.use_ai_var).grid(row=10, column=0, sticky='w', columnspan=2, pady=(10,0))
-            tk.Label(frm, text="Provedor IA:").grid(row=11, column=0, sticky='w', pady=(10,0))
+            tk.Checkbutton(frm, text="Usar IA para preencher [OBJETIVO_EMPRESA]", variable=self.use_ai_var).grid(row=9, column=0, sticky='w', columnspan=2, pady=(10,0))
+            tk.Label(frm, text="Provedor IA:").grid(row=10, column=0, sticky='w', pady=(10,0))
             self.ai_provider = tk.StringVar(value=os.environ.get('AI_PROVIDER', 'mock'))
-            tk.OptionMenu(frm, self.ai_provider, 'mock', 'hf', 'openai').grid(row=11, column=1, sticky='w')
+            tk.OptionMenu(frm, self.ai_provider, 'mock', 'hf', 'openai').grid(row=10, column=1, sticky='w')
             # Arquivo saída
-            tk.Label(frm, text="Arquivo saída (.docx):").grid(row=12, column=0, sticky='w', pady=(10,0))
+            tk.Label(frm, text="Arquivo saída (.docx):").grid(row=11, column=0, sticky='w', pady=(10,0))
             self.entry_out = tk.Entry(frm, width=60)
-            self.entry_out.grid(row=12, column=1, sticky='w')
+            self.entry_out.grid(row=11, column=1, sticky='w')
             self.entry_out.insert(0, 'relatorio_saida.docx')
             # Botão gerar
-            tk.Button(frm, text="Gerar Relatório", command=self.run).grid(row=13, column=1, pady=20)
+            tk.Button(frm, text="Gerar Relatório", command=self.run).grid(row=12, column=1, pady=20)
 
         def browse_template(self):
             p = filedialog.askopenfilename(filetypes=[('Word files', '*.docx')])
@@ -464,16 +493,22 @@ if TKINTER_AVAILABLE:
             mapping["DATA_BACKUP"] = self.entry_data_backup.get().strip()
             mapping["DATA_KICKOFF"] = self.entry_data_kickoff.get().strip()
             mapping["DATA_ENTREGA"] = self.entry_data_entrega.get().strip()
-            mapping["DOMINIO"] = self.entry_dominio.get().strip()
+            dominio = self.entry_dominio.get().strip()
+            mapping["DOMINIO"] = dominio
+            if dominio:
+                mapping["DOMINIOWP"] = dominio + "/wp-admin/"
+            else:
+                mapping["DOMINIOWP"] = ""
             mapping["DEMANDA"] = self.entry_demanda.get().strip()
-            mapping["DOMINIOWP"] = self.entry_dominiowp.get().strip()
-            mapping["ESPECIALISTARESPONSAVEL"] = self.entry_especialista.get().strip()
+            mapping["ESPECIALISTARESPONSAVEL"] = "ITALO GOMES"
             drive = self.entry_drive.get().strip()
             if drive:
                 if not drive.startswith(('http://', 'https://')):
                     drive = 'https://' + drive
                 mapping['LINK_DRIVE'] = drive
                 mapping['LINK_DRIVE_TEXT'] = self.entry_drive_text.get().strip() or 'Link Drive'
+                mapping['LINK_PARA_DOWNLOAD'] = drive
+                mapping['LINK_PARA_DOWNLOAD_TEXT'] = 'Link para download'
             if self.use_ai_var.get():
                 source_parts = []
                 if mapping.get('ATIVIDADE_PRINCIPAL'):
@@ -518,8 +553,6 @@ def main():
     parser.add_argument("--data-entrega", help="Data de entrega [DATA_ENTREGA]")
     parser.add_argument("--dominio", help="Texto [DOMINIO]")
     parser.add_argument("--demanda", help="Texto [DEMANDA]")
-    parser.add_argument("--dominiowp", help="Texto [DOMINIOWP]")
-    parser.add_argument("--especialista-responsavel", help="Texto [ESPECIALISTARESPONSAVEL]")
     parser.add_argument("--run-tests", action="store_true", help="Executar testes rápidos")
     args = parser.parse_args()
     if args.run_tests:
@@ -551,8 +584,6 @@ def main():
             "DATA_ENTREGA": args.data_entrega or "",
             "DOMINIO": args.dominio or "",
             "DEMANDA": args.demanda or "",
-            "DOMINIOWP": args.dominiowp or "",
-            "ESPECIALISTARESPONSAVEL": args.especialista_responsavel or "",
         }
         run_cli(
             template=args.template,
