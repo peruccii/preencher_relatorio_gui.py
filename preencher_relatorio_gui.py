@@ -8,6 +8,7 @@ Funcionalidades:
 - Preenche placeholders em template .docx
 - Gera [OBJETIVO_EMPRESA] opcional via provedor de IA (pluggable)
 - Insere hyperlink para [LINK_DRIVE] e [LINK_PARA_DOWNLOAD]
+- Insere imagem para [IDENTIDADE_VISUAL_E_PALETA_DE_CORES]
 - Modo GUI (Tkinter) quando disponível; caso contrário, modo CLI automático
 - Argumentos de linha de comando para rodar em modo não-GUI
 - Testes unitários simples acessíveis via --run-tests
@@ -22,6 +23,7 @@ import argparse
 import requests
 from pathlib import Path
 from typing import Dict, Optional
+from docx.shared import Inches
 # tenta importar tkinter dinamicamente (alguns ambientes não têm suporte)
 try:
     import tkinter as tk
@@ -121,6 +123,7 @@ def build_mapping(data: dict) -> dict:
         "DEMANDA": "",
         "DOMINIOWP": "",
         "ESPECIALISTARESPONSAVEL": "ITALO GOMES",
+        "IDENTIDADE_VISUAL_E_PALETA_DE_CORES": "",
     }
     return mapping
 
@@ -239,7 +242,7 @@ def add_hyperlink(paragraph, url: str, text: str):
 
 def replace_in_paragraph(paragraph, mapping: Dict[str, str]):
     full_text = "".join([r.text for r in paragraph.runs])
-    non_link_keys = {k: v for k, v in mapping.items() if k not in ("LINK_DRIVE", "LINK_DRIVE_TEXT", "LINK_PARA_DOWNLOAD", "LINK_PARA_DOWNLOAD_TEXT")}
+    non_link_keys = {k: v for k, v in mapping.items() if k not in ("LINK_DRIVE", "LINK_DRIVE_TEXT", "LINK_PARA_DOWNLOAD", "LINK_PARA_DOWNLOAD_TEXT", "IDENTIDADE_VISUAL_E_PALETA_DE_CORES")}
 
     # Handle [LINK_DRIVE]
     if "[LINK_DRIVE]" in full_text and mapping.get("LINK_DRIVE"):
@@ -273,6 +276,19 @@ def replace_in_paragraph(paragraph, mapping: Dict[str, str]):
             if idx < len(parts) - 1:
                 display = "Link para download"
                 add_hyperlink(paragraph, mapping["LINK_PARA_DOWNLOAD"], display)
+        return
+
+    # Handle [IDENTIDADE_VISUAL_E_PALETA_DE_CORES]
+    if "[IDENTIDADE_VISUAL_E_PALETA_DE_CORES]" in full_text:
+        image_path = mapping.get("IDENTIDADE_VISUAL_E_PALETA_DE_CORES")
+        # Clear all runs
+        for i in range(len(paragraph.runs) - 1, -1, -1):
+            paragraph._element.remove(paragraph.runs[i]._element)
+        if image_path and Path(image_path).exists():
+            run = paragraph.add_run()
+            run.add_picture(image_path, width=Inches(5.0))
+        else:
+            paragraph.add_run("Nenhuma imagem fornecida para Identidade Visual e Paleta de Cores.")
         return
 
     # Normal case: per-run replacement to preserve formatting
@@ -366,6 +382,7 @@ def run_cli(template: Optional[str] = None, cnpj: Optional[str] = None, drive: O
             "DATA_ENTREGA": "Data Entrega (opcional): ",
             "DOMINIO": "Domínio (opcional): ",
             "DEMANDA": "Demanda (opcional): ",
+            "IDENTIDADE_VISUAL_E_PALETA_DE_CORES": "Caminho da imagem para Identidade Visual e Paleta de Cores (opcional): ",
         }
         for field, prompt in extra_fields.items():
             value = extra_mapping.get(field, "") if extra_mapping else ""
@@ -448,30 +465,41 @@ if TKINTER_AVAILABLE:
             self.entry_dominio = tk.Entry(frm, width=40); self.entry_dominio.grid(row=6, column=1, sticky='w')
             tk.Label(frm, text="Demanda:").grid(row=7, column=0, sticky='w')
             self.entry_demanda = tk.Entry(frm, width=40); self.entry_demanda.grid(row=7, column=1, sticky='w')
-            # Removed DOMINIOWP entry - auto-generated
-            tk.Label(frm, text="Especialista Responsável:").grid(row=8, column=0, sticky='w')
-            self.entry_especialista = tk.Entry(frm, width=40); self.entry_especialista.grid(row=8, column=1, sticky='w')
+            # New field: Identidade Visual e Paleta de cores
+            tk.Label(frm, text="Identidade Visual e Paleta de cores:").grid(row=8, column=0, sticky='w')
+            self.entry_identidade = tk.Entry(frm, width=60)
+            self.entry_identidade.grid(row=8, column=1, sticky='w')
+            tk.Button(frm, text="Selecionar Imagem", command=self.browse_identidade).grid(row=8, column=2)
+            # Especialista
+            tk.Label(frm, text="Especialista Responsável:").grid(row=9, column=0, sticky='w')
+            self.entry_especialista = tk.Entry(frm, width=40); self.entry_especialista.grid(row=9, column=1, sticky='w')
             self.entry_especialista.insert(0, "ITALO GOMES")
             self.entry_especialista.config(state="readonly")  # Make it read-only
             # IA
             self.use_ai_var = tk.IntVar(value=1)
-            tk.Checkbutton(frm, text="Usar IA para preencher [OBJETIVO_EMPRESA]", variable=self.use_ai_var).grid(row=9, column=0, sticky='w', columnspan=2, pady=(10,0))
-            tk.Label(frm, text="Provedor IA:").grid(row=10, column=0, sticky='w', pady=(10,0))
+            tk.Checkbutton(frm, text="Usar IA para preencher [OBJETIVO_EMPRESA]", variable=self.use_ai_var).grid(row=10, column=0, sticky='w', columnspan=2, pady=(10,0))
+            tk.Label(frm, text="Provedor IA:").grid(row=11, column=0, sticky='w', pady=(10,0))
             self.ai_provider = tk.StringVar(value=os.environ.get('AI_PROVIDER', 'mock'))
-            tk.OptionMenu(frm, self.ai_provider, 'mock', 'hf', 'openai').grid(row=10, column=1, sticky='w')
+            tk.OptionMenu(frm, self.ai_provider, 'mock', 'hf', 'openai').grid(row=11, column=1, sticky='w')
             # Arquivo saída
-            tk.Label(frm, text="Arquivo saída (.docx):").grid(row=11, column=0, sticky='w', pady=(10,0))
+            tk.Label(frm, text="Arquivo saída (.docx):").grid(row=12, column=0, sticky='w', pady=(10,0))
             self.entry_out = tk.Entry(frm, width=60)
-            self.entry_out.grid(row=11, column=1, sticky='w')
+            self.entry_out.grid(row=12, column=1, sticky='w')
             self.entry_out.insert(0, 'relatorio_saida.docx')
             # Botão gerar
-            tk.Button(frm, text="Gerar Relatório", command=self.run).grid(row=12, column=1, pady=20)
+            tk.Button(frm, text="Gerar Relatório", command=self.run).grid(row=13, column=1, pady=20)
 
         def browse_template(self):
             p = filedialog.askopenfilename(filetypes=[('Word files', '*.docx')])
             if p:
                 self.entry_template.delete(0, tk.END)
                 self.entry_template.insert(0, p)
+
+        def browse_identidade(self):
+            p = filedialog.askopenfilename(filetypes=[('Image files', '*.jpg *.jpeg *.png *.gif *.bmp *.tiff')])
+            if p:
+                self.entry_identidade.delete(0, tk.END)
+                self.entry_identidade.insert(0, p)
 
         def run(self):
             template = self.entry_template.get().strip()
@@ -500,6 +528,7 @@ if TKINTER_AVAILABLE:
             else:
                 mapping["DOMINIOWP"] = ""
             mapping["DEMANDA"] = self.entry_demanda.get().strip()
+            mapping["IDENTIDADE_VISUAL_E_PALETA_DE_CORES"] = self.entry_identidade.get().strip()
             mapping["ESPECIALISTARESPONSAVEL"] = "ITALO GOMES"
             drive = self.entry_drive.get().strip()
             if drive:
@@ -553,6 +582,7 @@ def main():
     parser.add_argument("--data-entrega", help="Data de entrega [DATA_ENTREGA]")
     parser.add_argument("--dominio", help="Texto [DOMINIO]")
     parser.add_argument("--demanda", help="Texto [DEMANDA]")
+    parser.add_argument("--identidade-visual", help="Caminho da imagem [IDENTIDADE_VISUAL_E_PALETA_DE_CORES]")
     parser.add_argument("--run-tests", action="store_true", help="Executar testes rápidos")
     args = parser.parse_args()
     if args.run_tests:
@@ -584,6 +614,7 @@ def main():
             "DATA_ENTREGA": args.data_entrega or "",
             "DOMINIO": args.dominio or "",
             "DEMANDA": args.demanda or "",
+            "IDENTIDADE_VISUAL_E_PALETA_DE_CORES": args.identidade_visual or "",
         }
         run_cli(
             template=args.template,
