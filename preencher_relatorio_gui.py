@@ -8,7 +8,7 @@ Funcionalidades:
 - Preenche placeholders em template .docx
 - Gera [OBJETIVO_EMPRESA] opcional via provedor de IA (pluggable)
 - Insere hyperlink para [LINK_DRIVE] e [LINK_PARA_DOWNLOAD]
-- Insere imagem para [IDENTIDADE_VISUAL_E_PALETA_DE_CORES]
+- Insere imagem para [IDENTIDADE_VISUAL_E_PALETA_DE_CORES] e páginas específicas
 - Modo GUI (Tkinter) quando disponível; caso contrário, modo CLI automático
 - Argumentos de linha de comando para rodar em modo não-GUI
 - Testes unitários simples acessíveis via --run-tests
@@ -21,8 +21,22 @@ import sys
 import json
 import argparse
 import requests
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Dict, Optional
+
+# Selenium (opcional)
+try:
+    from selenium import webdriver
+    from selenium.webdriver.common.By import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.chrome.options import Options
+    from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
+    SELENIUM_AVAILABLE = True
+except Exception:
+    SELENIUM_AVAILABLE = False
 from docx.shared import Inches
 # tenta importar tkinter dinamicamente (alguns ambientes não têm suporte)
 try:
@@ -39,16 +53,64 @@ from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
+
+# Pillow (opcional para colar imagens)
+try:
+    from PIL import ImageGrab, Image
+    PILLOW_AVAILABLE = True
+except ImportError:
+    PILLOW_AVAILABLE = False
+    ImageGrab = None
+    Image = None
+
+
 # ----------------- Configuração -----------------
 RECEITAWS_URL = "https://www.receitaws.com.br/v1/cnpj/{}"
 REQUEST_TIMEOUT = 10
 PLACEHOLDER_PATTERN = re.compile(r'\[([A-Z0-9_]+)\]')
+# Lista de campos de imagem
+IMAGE_FIELDS = [
+    "IDENTIDADE_VISUAL_E_PALETA_DE_CORES",
+    "PAGINA_HOME_IMG",
+    "PAGINA_PRODUTOS_IMG",
+    "PAGINA_QUEM_SOMOS_IMG",
+    "PAGINA_CONTATO_IMG",
+    "DETALHES_PEDIDO",
+    "DETALHES_PRODUTO",
+    "TODOS_PRODUTOS"
+]
 # ----------------- Utilitários -----------------
 def normalize_cnpj(cnpj_raw: str) -> str:
     digits = re.sub(r'\D', '', cnpj_raw or '')
     if len(digits) != 14:
         raise ValueError("CNPJ deve conter 14 dígitos (após remover pontuação).")
     return digits
+
+def normalize_image_path(image_path: str) -> str:
+    """
+    Normaliza o caminho da imagem para evitar problemas com espaços.
+    Se o caminho contém espaços, cria uma cópia temporária sem espaços.
+    """
+    if not image_path or not Path(image_path).exists():
+        return image_path
+    # Se não tem espaços, retorna o caminho original
+    if ' ' not in image_path:
+        return image_path
+    # Cria um arquivo temporário sem espaços
+    original_path = Path(image_path)
+    file_extension = original_path.suffix
+    temp_dir = Path(tempfile.gettempdir()) / "docx_images"
+    temp_dir.mkdir(exist_ok=True)
+    # Gera nome sem espaços baseado no nome original
+    safe_name = re.sub(r'[^\w\-_.]', '_', original_path.stem)
+    temp_path = temp_dir / f"{safe_name}{file_extension}"
+    # Copia o arquivo para o local temporário
+    try:
+        shutil.copy2(image_path, temp_path)
+        return str(temp_path)
+    except Exception as e:
+        print(f"Warning: Não foi possível criar cópia temporária da imagem: {e}", file=sys.stderr)
+        return image_path
 
 def consulta_empresa(cnpj: str) -> dict:
     url = RECEITAWS_URL.format(cnpj)
@@ -87,11 +149,13 @@ def build_mapping(data: dict) -> dict:
             atividade_principal = data["atividade_principal"][0].get("text", "")
         except Exception:
             atividade_principal = str(data.get("atividade_principal"))
+
     resumo = " | ".join(filter(None, [
         atividade_principal,
         safe_get("porte"),
         safe_get("situacao")
     ]))
+
     endereco = " - ".join(filter(None, [
         safe_get("logradouro"),
         safe_get("numero"),
@@ -100,6 +164,7 @@ def build_mapping(data: dict) -> dict:
         safe_get("uf"),
         safe_get("cep"),
     ]))
+
     mapping = {
         "NOME_EMPRESA_CLIENTE": safe_get("nome"),
         "FANTASIA": safe_get("fantasia"),
@@ -122,8 +187,17 @@ def build_mapping(data: dict) -> dict:
         "DOMINIO": "",
         "DEMANDA": "",
         "DOMINIOWP": "",
-        "ESPECIALISTARESPONSAVEL": "ITALO GOMES",
+        "ESPECIALISTARESPONSAVEL": "ITALO FELIPE IGNACIO",
         "IDENTIDADE_VISUAL_E_PALETA_DE_CORES": "",
+        "PAGINA_HOME_IMG": "",
+        "PAGINA_PRODUTOS_IMG": "",
+        "PAGINA_QUEM_SOMOS_IMG": "",
+        "PAGINA_CONTATO_IMG": "",
+        "HOSPEDAGEM": "",
+        "EMAIL_CRIADO": "",
+        "DETALHES_PEDIDO": "",
+        "DETALHES_PRODUTO": "",
+        "TODOS_PRODUTOS": "",
     }
     return mapping
 
@@ -242,8 +316,7 @@ def add_hyperlink(paragraph, url: str, text: str):
 
 def replace_in_paragraph(paragraph, mapping: Dict[str, str]):
     full_text = "".join([r.text for r in paragraph.runs])
-    non_link_keys = {k: v for k, v in mapping.items() if k not in ("LINK_DRIVE", "LINK_DRIVE_TEXT", "LINK_PARA_DOWNLOAD", "LINK_PARA_DOWNLOAD_TEXT", "IDENTIDADE_VISUAL_E_PALETA_DE_CORES")}
-
+    non_link_keys = {k: v for k, v in mapping.items() if k not in ("LINK_DRIVE", "LINK_DRIVE_TEXT", "LINK_PARA_DOWNLOAD", "LINK_PARA_DOWNLOAD_TEXT") + tuple(IMAGE_FIELDS)}
     # Handle [LINK_DRIVE]
     if "[LINK_DRIVE]" in full_text and mapping.get("LINK_DRIVE"):
         parts = full_text.split("[LINK_DRIVE]")
@@ -260,7 +333,6 @@ def replace_in_paragraph(paragraph, mapping: Dict[str, str]):
                 display = mapping.get("LINK_DRIVE_TEXT") or "Link Drive"
                 add_hyperlink(paragraph, mapping["LINK_DRIVE"], display)
         return
-
     # Handle [LINK_PARA_DOWNLOAD]
     if "[LINK_PARA_DOWNLOAD]" in full_text and mapping.get("LINK_PARA_DOWNLOAD"):
         parts = full_text.split("[LINK_PARA_DOWNLOAD]")
@@ -277,27 +349,35 @@ def replace_in_paragraph(paragraph, mapping: Dict[str, str]):
                 display = "Link para download"
                 add_hyperlink(paragraph, mapping["LINK_PARA_DOWNLOAD"], display)
         return
-
-    # Handle [IDENTIDADE_VISUAL_E_PALETA_DE_CORES]
-    if "[IDENTIDADE_VISUAL_E_PALETA_DE_CORES]" in full_text:
-        image_path = mapping.get("IDENTIDADE_VISUAL_E_PALETA_DE_CORES")
-        # Clear all runs
-        for i in range(len(paragraph.runs) - 1, -1, -1):
-            paragraph._element.remove(paragraph.runs[i]._element)
-        if image_path and Path(image_path).exists():
-            run = paragraph.add_run()
-            run.add_picture(image_path, width=Inches(5.0))
-        else:
-            paragraph.add_run("Nenhuma imagem fornecida para Identidade Visual e Paleta de Cores.")
-        return
-
+    # Handle image fields
+    for image_field in IMAGE_FIELDS:
+        if f"[{image_field}]" in full_text:
+            image_path = mapping.get(image_field)
+            # Clear all runs
+            for i in range(len(paragraph.runs) - 1, -1, -1):
+                paragraph._element.remove(paragraph.runs[i]._element)
+            if image_path:
+                # Normaliza o caminho para evitar problemas com espaços
+                normalized_path = normalize_image_path(image_path)
+                if Path(normalized_path).exists():
+                    try:
+                        run = paragraph.add_run()
+                        run.add_picture(normalized_path, width=Inches(5.0))
+                    except Exception as e:
+                        error_msg = f"Erro ao inserir imagem {image_field}: {e}"
+                        print(error_msg, file=sys.stderr)
+                        paragraph.add_run(error_msg)
+                else:
+                    paragraph.add_run(f"Imagem não encontrada para {image_field}: {image_path}")
+            else:
+                paragraph.add_run(f"Nenhuma imagem fornecida para {image_field}.")
+            return
     # Normal case: per-run replacement to preserve formatting
     for run in paragraph.runs:
         text = run.text
         for key, val in non_link_keys.items():
             text = text.replace(f'[{key}]', val or "")
         run.text = text
-
     # Check for remaining placeholders (spanning runs)
     new_full_text = "".join([r.text for r in paragraph.runs])
     remaining = PLACEHOLDER_PATTERN.findall(new_full_text)
@@ -374,7 +454,6 @@ def run_cli(template: Optional[str] = None, cnpj: Optional[str] = None, drive: O
             mapping["LINK_DRIVE_TEXT"] = drive_text or input("Texto do link (ENTER para 'Link Drive'): ").strip() or "Link Drive"
             mapping["LINK_PARA_DOWNLOAD"] = drive
             mapping["LINK_PARA_DOWNLOAD_TEXT"] = "Link para download"
-
         # Handle extra fields
         extra_fields = {
             "DATA_BACKUP": "Data Backup (opcional): ",
@@ -382,23 +461,29 @@ def run_cli(template: Optional[str] = None, cnpj: Optional[str] = None, drive: O
             "DATA_ENTREGA": "Data Entrega (opcional): ",
             "DOMINIO": "Domínio (opcional): ",
             "DEMANDA": "Demanda (opcional): ",
+            "HOSPEDAGEM": "Hospedagem (HOSTINGER, LOCALWEB, UOL ou custom, separados por vírgula): ",
+            "EMAIL_CRIADO": "Email Criado (opcional): ",
             "IDENTIDADE_VISUAL_E_PALETA_DE_CORES": "Caminho da imagem para Identidade Visual e Paleta de Cores (opcional): ",
+            "PAGINA_HOME_IMG": "Caminho da imagem para Página Home (opcional): ",
+            "PAGINA_PRODUTOS_IMG": "Caminho da imagem para Página Produtos (opcional): ",
+            "PAGINA_QUEM_SOMOS_IMG": "Caminho da imagem para Página Quem Somos (opcional): ",
+            "PAGINA_CONTATO_IMG": "Caminho da imagem para Página Contato (opcional): ",
+            "DETALHES_PEDIDO": "Caminho da imagem para Detalhes Pedido (opcional): ",
+            "DETALHES_PRODUTO": "Caminho da imagem para Detalhes Produto (opcional): ",
+            "TODOS_PRODUTOS": "Caminho da imagem para Todos Produtos (opcional): ",
         }
         for field, prompt in extra_fields.items():
             value = extra_mapping.get(field, "") if extra_mapping else ""
             if not value:
                 value = input(prompt).strip()
             mapping[field] = value
-
         # Auto-set DOMINIOWP based on DOMINIO
         if mapping.get("DOMINIO"):
             mapping["DOMINIOWP"] = mapping["DOMINIO"] + "/wp-admin/"
         else:
             mapping["DOMINIOWP"] = ""
-
         # ESPECIALISTARESPONSAVEL is always fixed
-        mapping["ESPECIALISTARESPONSAVEL"] = "ITALO GOMES"
-
+        mapping["ESPECIALISTARESPONSAVEL"] = "ITALO FELIPE IGNACIO"
         if use_ai is None:
             use_ai = input("Deseja usar IA para preencher [OBJETIVO_EMPRESA]? (s/N): ").strip().lower() == 's'
         if use_ai:
@@ -436,58 +521,170 @@ if TKINTER_AVAILABLE:
         def __init__(self, root):
             self.root = root
             root.title("Gerador de Relatório - CNPJ -> Word")
-            frm = tk.Frame(root, padx=10, pady=10)
+            # Criar frame principal com scrollbar
+            main_frame = tk.Frame(root)
+            main_frame.pack(fill=tk.BOTH, expand=True)
+            canvas = tk.Canvas(main_frame)
+            scrollbar = tk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+            scrollable_frame = tk.Frame(canvas)
+            scrollable_frame.bind(
+                "<Configure>",
+                lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+            )
+            canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+            canvas.configure(yscrollcommand=scrollbar.set)
+            canvas.pack(side="left", fill="both", expand=True)
+            scrollbar.pack(side="right", fill="y")
+            frm = tk.Frame(scrollable_frame, padx=10, pady=10)
             frm.pack(fill=tk.BOTH, expand=True)
+            row = 0
             # Template
-            tk.Label(frm, text="Template (.docx):").grid(row=0, column=0, sticky='w')
+            tk.Label(frm, text="Template (.docx):").grid(row=row, column=0, sticky='w')
             self.entry_template = tk.Entry(frm, width=60)
-            self.entry_template.grid(row=0, column=1, sticky='w')
-            tk.Button(frm, text="Abrir", command=self.browse_template).grid(row=0, column=2)
+            self.entry_template.grid(row=row, column=1, sticky='w')
+            tk.Button(frm, text="Abrir", command=self.browse_template).grid(row=row, column=2)
+            row += 1
             # CNPJ
-            tk.Label(frm, text="CNPJ da empresa:").grid(row=1, column=0, sticky='w', pady=(10,0))
+            tk.Label(frm, text="CNPJ da empresa:").grid(row=row, column=0, sticky='w', pady=(10,0))
             self.entry_cnpj = tk.Entry(frm, width=40)
-            self.entry_cnpj.grid(row=1, column=1, sticky='w', pady=(10,0))
+            self.entry_cnpj.grid(row=row, column=1, sticky='w', pady=(10,0))
+            row += 1
             # Link Drive
-            tk.Label(frm, text="Link do Drive (opcional):").grid(row=2, column=0, sticky='w')
+            tk.Label(frm, text="Link do Drive (opcional):").grid(row=row, column=0, sticky='w')
             self.entry_drive = tk.Entry(frm, width=60)
-            self.entry_drive.grid(row=2, column=1, sticky='w')
-            tk.Label(frm, text="Texto do Link:").grid(row=2, column=2, sticky='w')
+            self.entry_drive.grid(row=row, column=1, sticky='w')
+            tk.Label(frm, text="Texto do Link:").grid(row=row, column=2, sticky='w')
             self.entry_drive_text = tk.Entry(frm, width=20)
-            self.entry_drive_text.grid(row=2, column=3, sticky='w')
+            self.entry_drive_text.grid(row=row, column=3, sticky='w')
+            row += 1
             # Extra fields
-            tk.Label(frm, text="Data Backup:").grid(row=3, column=0, sticky='w')
-            self.entry_data_backup = tk.Entry(frm, width=20); self.entry_data_backup.grid(row=3, column=1, sticky='w')
-            tk.Label(frm, text="Data Kickoff:").grid(row=4, column=0, sticky='w')
-            self.entry_data_kickoff = tk.Entry(frm, width=20); self.entry_data_kickoff.grid(row=4, column=1, sticky='w')
-            tk.Label(frm, text="Data Entrega:").grid(row=5, column=0, sticky='w')
-            self.entry_data_entrega = tk.Entry(frm, width=20); self.entry_data_entrega.grid(row=5, column=1, sticky='w')
-            tk.Label(frm, text="Domínio:").grid(row=6, column=0, sticky='w')
-            self.entry_dominio = tk.Entry(frm, width=40); self.entry_dominio.grid(row=6, column=1, sticky='w')
-            tk.Label(frm, text="Demanda:").grid(row=7, column=0, sticky='w')
-            self.entry_demanda = tk.Entry(frm, width=40); self.entry_demanda.grid(row=7, column=1, sticky='w')
-            # New field: Identidade Visual e Paleta de cores
-            tk.Label(frm, text="Identidade Visual e Paleta de cores:").grid(row=8, column=0, sticky='w')
+            tk.Label(frm, text="Data Backup:").grid(row=row, column=0, sticky='w')
+            self.entry_data_backup = tk.Entry(frm, width=20)
+            self.entry_data_backup.grid(row=row, column=1, sticky='w')
+            row += 1
+            tk.Label(frm, text="Data Kickoff:").grid(row=row, column=0, sticky='w')
+            self.entry_data_kickoff = tk.Entry(frm, width=20)
+            self.entry_data_kickoff.grid(row=row, column=1, sticky='w')
+            row += 1
+            tk.Label(frm, text="Data Entrega:").grid(row=row, column=0, sticky='w')
+            self.entry_data_entrega = tk.Entry(frm, width=20)
+            self.entry_data_entrega.grid(row=row, column=1, sticky='w')
+            row += 1
+            tk.Label(frm, text="Domínio:").grid(row=row, column=0, sticky='w')
+            self.entry_dominio = tk.Entry(frm, width=40)
+            self.entry_dominio.grid(row=row, column=1, sticky='w')
+            row += 1
+            tk.Label(frm, text="Demanda:").grid(row=row, column=0, sticky='w')
+            self.entry_demanda = tk.Entry(frm, width=40)
+            self.entry_demanda.grid(row=row, column=1, sticky='w')
+            row += 1
+            tk.Label(frm, text="Email Criado:").grid(row=row, column=0, sticky='w')
+            self.entry_email_criado = tk.Entry(frm, width=40)
+            self.entry_email_criado.grid(row=row, column=1, sticky='w')
+            row += 1
+            # Hospedagem
+            tk.Label(frm, text="Hospedagem:").grid(row=row, column=0, sticky='w', pady=(10,0))
+            self.hostinger_var = tk.IntVar()
+            tk.Checkbutton(frm, text="HOSTINGER", variable=self.hostinger_var).grid(row=row, column=1, sticky='w')
+            row += 1
+            self.localweb_var = tk.IntVar()
+            tk.Checkbutton(frm, text="LOCALWEB", variable=self.localweb_var).grid(row=row, column=1, sticky='w')
+            row += 1
+            self.uol_var = tk.IntVar()
+            tk.Checkbutton(frm, text="UOL", variable=self.uol_var).grid(row=row, column=1, sticky='w')
+            row += 1
+            tk.Label(frm, text="Hospedagem Custom:").grid(row=row, column=0, sticky='w')
+            self.entry_hospedagem_custom = tk.Entry(frm, width=40)
+            self.entry_hospedagem_custom.grid(row=row, column=1, sticky='w')
+            row += 1
+            # Separador para imagens
+            tk.Label(frm, text="--- IMAGENS ---", font=("Arial", 10, "bold")).grid(row=row, column=0, columnspan=4, pady=10)
+            row += 1
+            # Identidade Visual e Paleta de cores
+            tk.Label(frm, text="Identidade Visual e Paleta de cores:").grid(row=row, column=0, sticky='w')
             self.entry_identidade = tk.Entry(frm, width=60)
-            self.entry_identidade.grid(row=8, column=1, sticky='w')
-            tk.Button(frm, text="Selecionar Imagem", command=self.browse_identidade).grid(row=8, column=2)
+            self.entry_identidade.grid(row=row, column=1, sticky='w')
+            tk.Button(frm, text="Selecionar", command=lambda: self.browse_image(self.entry_identidade)).grid(row=row, column=2)
+            tk.Button(frm, text="Colar", command=lambda: self.paste_image_from_clipboard(self.entry_identidade)).grid(row=row, column=3)
+            row += 1
+            # Página Home
+            tk.Label(frm, text="Página Home:").grid(row=row, column=0, sticky='w')
+            self.entry_pagina_home = tk.Entry(frm, width=60)
+            self.entry_pagina_home.grid(row=row, column=1, sticky='w')
+            tk.Button(frm, text="Selecionar", command=lambda: self.browse_image(self.entry_pagina_home)).grid(row=row, column=2)
+            tk.Button(frm, text="Colar", command=lambda: self.paste_image_from_clipboard(self.entry_pagina_home)).grid(row=row, column=3)
+            row += 1
+            # Página Produtos
+            tk.Label(frm, text="Página Produtos:").grid(row=row, column=0, sticky='w')
+            self.entry_pagina_produtos = tk.Entry(frm, width=60)
+            self.entry_pagina_produtos.grid(row=row, column=1, sticky='w')
+            tk.Button(frm, text="Selecionar", command=lambda: self.browse_image(self.entry_pagina_produtos)).grid(row=row, column=2)
+            tk.Button(frm, text="Colar", command=lambda: self.paste_image_from_clipboard(self.entry_pagina_produtos)).grid(row=row, column=3)
+            row += 1
+            # Página Quem Somos
+            tk.Label(frm, text="Página Quem Somos:").grid(row=row, column=0, sticky='w')
+            self.entry_pagina_quem_somos = tk.Entry(frm, width=60)
+            self.entry_pagina_quem_somos.grid(row=row, column=1, sticky='w')
+            tk.Button(frm, text="Selecionar", command=lambda: self.browse_image(self.entry_pagina_quem_somos)).grid(row=row, column=2)
+            tk.Button(frm, text="Colar", command=lambda: self.paste_image_from_clipboard(self.entry_pagina_quem_somos)).grid(row=row, column=3)
+            row += 1
+            # Página Contato
+            tk.Label(frm, text="Página Contato:").grid(row=row, column=0, sticky='w')
+            self.entry_pagina_contato = tk.Entry(frm, width=60)
+            self.entry_pagina_contato.grid(row=row, column=1, sticky='w')
+            tk.Button(frm, text="Selecionar", command=lambda: self.browse_image(self.entry_pagina_contato)).grid(row=row, column=2)
+            tk.Button(frm, text="Colar", command=lambda: self.paste_image_from_clipboard(self.entry_pagina_contato)).grid(row=row, column=3)
+            row += 1
+            # Detalhes Pedido
+            tk.Label(frm, text="Detalhes Pedido:").grid(row=row, column=0, sticky='w')
+            self.entry_detalhes_pedido = tk.Entry(frm, width=60)
+            self.entry_detalhes_pedido.grid(row=row, column=1, sticky='w')
+            tk.Button(frm, text="Selecionar", command=lambda: self.browse_image(self.entry_detalhes_pedido)).grid(row=row, column=2)
+            tk.Button(frm, text="Colar", command=lambda: self.paste_image_from_clipboard(self.entry_detalhes_pedido)).grid(row=row, column=3)
+            row += 1
+            # Detalhes Produto
+            tk.Label(frm, text="Detalhes Produto:").grid(row=row, column=0, sticky='w')
+            self.entry_detalhes_produto = tk.Entry(frm, width=60)
+            self.entry_detalhes_produto.grid(row=row, column=1, sticky='w')
+            tk.Button(frm, text="Selecionar", command=lambda: self.browse_image(self.entry_detalhes_produto)).grid(row=row, column=2)
+            tk.Button(frm, text="Colar", command=lambda: self.paste_image_from_clipboard(self.entry_detalhes_produto)).grid(row=row, column=3)
+            row += 1
+            # Todos Produtos
+            tk.Label(frm, text="Todos Produtos:").grid(row=row, column=0, sticky='w')
+            self.entry_todos_produtos = tk.Entry(frm, width=60)
+            self.entry_todos_produtos.grid(row=row, column=1, sticky='w')
+            tk.Button(frm, text="Selecionar", command=lambda: self.browse_image(self.entry_todos_produtos)).grid(row=row, column=2)
+            tk.Button(frm, text="Colar", command=lambda: self.paste_image_from_clipboard(self.entry_todos_produtos)).grid(row=row, column=3)
+            row += 1
+            # Separador
+            tk.Label(frm, text="--- CONFIGURAÇÕES ---", font=("Arial", 10, "bold")).grid(row=row, column=0, columnspan=3, pady=10)
+            row += 1
             # Especialista
-            tk.Label(frm, text="Especialista Responsável:").grid(row=9, column=0, sticky='w')
-            self.entry_especialista = tk.Entry(frm, width=40); self.entry_especialista.grid(row=9, column=1, sticky='w')
-            self.entry_especialista.insert(0, "ITALO GOMES")
-            self.entry_especialista.config(state="readonly")  # Make it read-only
+            tk.Label(frm, text="Especialista Responsável:").grid(row=row, column=0, sticky='w')
+            self.entry_especialista = tk.Entry(frm, width=40)
+            self.entry_especialista.grid(row=row, column=1, sticky='w')
+            self.entry_especialista.insert(0, "ITALO FELIPE IGNACIO")
+            self.entry_especialista.config(state="readonly") # Make it read-only
+            row += 1
             # IA
             self.use_ai_var = tk.IntVar(value=1)
-            tk.Checkbutton(frm, text="Usar IA para preencher [OBJETIVO_EMPRESA]", variable=self.use_ai_var).grid(row=10, column=0, sticky='w', columnspan=2, pady=(10,0))
-            tk.Label(frm, text="Provedor IA:").grid(row=11, column=0, sticky='w', pady=(10,0))
+            tk.Checkbutton(frm, text="Usar IA para preencher [OBJETIVO_EMPRESA]", variable=self.use_ai_var).grid(row=row, column=0, sticky='w', columnspan=2, pady=(10,0))
+            row += 1
+            tk.Label(frm, text="Provedor IA:").grid(row=row, column=0, sticky='w', pady=(10,0))
             self.ai_provider = tk.StringVar(value=os.environ.get('AI_PROVIDER', 'mock'))
-            tk.OptionMenu(frm, self.ai_provider, 'mock', 'hf', 'openai').grid(row=11, column=1, sticky='w')
+            tk.OptionMenu(frm, self.ai_provider, 'mock', 'hf', 'openai').grid(row=row, column=1, sticky='w')
+            row += 1
             # Arquivo saída
-            tk.Label(frm, text="Arquivo saída (.docx):").grid(row=12, column=0, sticky='w', pady=(10,0))
+            tk.Label(frm, text="Arquivo saída (.docx):").grid(row=row, column=0, sticky='w', pady=(10,0))
             self.entry_out = tk.Entry(frm, width=60)
-            self.entry_out.grid(row=12, column=1, sticky='w')
+            self.entry_out.grid(row=row, column=1, sticky='w')
             self.entry_out.insert(0, 'relatorio_saida.docx')
-            # Botão gerar
-            tk.Button(frm, text="Gerar Relatório", command=self.run).grid(row=13, column=1, pady=20)
+            row += 1
+            # Botões de ação
+            actions = tk.Frame(frm, pady=10)
+            actions.grid(row=row, column=0, columnspan=3, sticky='w')
+            tk.Button(actions, text="Gerar Relatório", command=self.run, bg="lightgreen", font=("Arial", 12, "bold")).grid(row=0, column=0, padx=(0,10))
+            tk.Button(actions, text="Preencher automaticamente", command=self.auto_fill).grid(row=0, column=1)
 
         def browse_template(self):
             p = filedialog.askopenfilename(filetypes=[('Word files', '*.docx')])
@@ -495,11 +692,514 @@ if TKINTER_AVAILABLE:
                 self.entry_template.delete(0, tk.END)
                 self.entry_template.insert(0, p)
 
-        def browse_identidade(self):
+        def browse_image(self, entry_widget):
             p = filedialog.askopenfilename(filetypes=[('Image files', '*.jpg *.jpeg *.png *.gif *.bmp *.tiff')])
             if p:
+                entry_widget.delete(0, tk.END)
+                entry_widget.insert(0, p)
+
+        def paste_image_from_clipboard(self, entry_widget):
+            """Tenta colar uma imagem da área de transferência no widget de entrada."""
+            if not PILLOW_AVAILABLE:
+                messagebox.showwarning("Funcionalidade Indisponível",
+                                     "A biblioteca 'Pillow' é necessária para colar imagens. "
+                                     "Instale com: pip install Pillow")
+                return
+
+            image = None
+            try:
+                # ImageGrab.grabclipboard() pode ser uma imagem ou uma lista de arquivos
+                image = ImageGrab.grabclipboard()
+            except Exception:
+                # Se o clipboard não contiver uma imagem, o ImageGrab pode falhar.
+                # Tentamos obter o conteúdo como texto, que pode ser um caminho de arquivo.
+                pass
+
+            # Se nenhuma imagem foi obtida, verifique se há um caminho de arquivo no clipboard
+            if image is None:
+                try:
+                    clipboard_content = self.root.clipboard_get()
+                    path = Path(clipboard_content.strip())
+                    if path.exists() and path.is_file():
+                        entry_widget.delete(0, tk.END)
+                        entry_widget.insert(0, str(path.resolve()))
+                        return
+                except (tk.TclError, Exception):
+                     # Não é um texto ou não é um caminho válido, ignorar.
+                     pass
+                
+                messagebox.showinfo("Informação", "Nenhuma imagem ou caminho de arquivo válido encontrado na área de transferência.")
+                return
+
+            # Se for uma lista de arquivos (comum no Windows)
+            if isinstance(image, list):
+                filepath = image[0]
+                if Path(filepath).exists():
+                    entry_widget.delete(0, tk.END)
+                    entry_widget.insert(0, str(Path(filepath).resolve()))
+                    return
+            
+            # Se for um objeto de imagem
+            if isinstance(image, Image.Image):
+                try:
+                    temp_dir = Path(tempfile.gettempdir()) / "docx_images_pasted"
+                    temp_dir.mkdir(exist_ok=True)
+                    
+                    timestamp = int(time.time())
+                    temp_path = temp_dir / f"pasted_image_{timestamp}.png"
+                    
+                    image.save(temp_path, "PNG")
+                    
+                    entry_widget.delete(0, tk.END)
+                    entry_widget.insert(0, str(temp_path))
+                except Exception as e:
+                    messagebox.showerror("Erro", f"Falha ao salvar a imagem colada: {e}")
+                return
+
+            messagebox.showinfo("Informação", "O conteúdo da área de transferência não é uma imagem reconhecida.")
+
+        def auto_fill(self):
+            try:
+                from selenium import webdriver
+                from selenium.webdriver.common.by import By
+                from selenium.webdriver.support.ui import WebDriverWait
+                from selenium.webdriver.support import expected_conditions as EC
+                from selenium.webdriver.chrome.options import Options
+                from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
+            except Exception as e:
+                messagebox.showerror('Erro', f'Selenium não está disponível neste executável: {e}')
+                return
+
+            dominio = self.entry_dominio.get().strip()
+            if not dominio:
+                messagebox.showerror('Erro', 'Informe go Domínio (ex: exemplo.com)')
+                return
+            if not dominio.startswith(('http://', 'https://')):
+                dominio = 'https://' + dominio
+            url = dominio.rstrip('/') + '/wp-admin/'
+            out_img = self.entry_identidade.get().strip()
+            if not out_img:
+                try:
+                    base_dir = os.path.expanduser('~/Pictures/relatorios_auto')
+                    os.makedirs(base_dir, exist_ok=True)
+                except Exception:
+                    base_dir = os.getcwd()
+                domain_slug = re.sub(r'[^a-zA-Z0-9]+', '_', dominio)
+                filename = f"s/style_guide_{domain_slug}_{int(time.time())}.png"
+                out_img = os.path.join(base_dir, filename)
                 self.entry_identidade.delete(0, tk.END)
-                self.entry_identidade.insert(0, p)
+                self.entry_identidade.insert(0, out_img)
+
+            chrome_opts = Options()
+            chrome_opts.add_argument('--no-sandbox')
+            chrome_opts.add_argument('--disable-dev-shm-usage')
+            chrome_opts.add_argument('--start-maximized')
+            driver = None
+            try:
+                driver = webdriver.Chrome(options=chrome_opts)
+                driver.set_page_load_timeout(30)
+                driver.get(url)
+                try:
+                    driver.maximize_window()
+                except Exception:
+                    pass
+                WebDriverWait(driver, 10).until(lambda d: d.execute_script('return document.readyState') == 'complete')
+
+                # Login se necessário
+                try:
+                    user = WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.ID, 'user_login')))
+                    pwd = driver.find_element(By.ID, 'user_pass')
+                    btn = driver.find_element(By.ID, 'wp-submit')
+                    user.send_keys('admin')
+                    pwd.send_keys('Senai@127')
+                    btn.click()
+                    WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, 'wpadminbar')))
+                except TimeoutException:
+                    pass
+
+                WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, 'adminmenumain')))
+
+                # ----------------- FLUXO 1: Prints do site público -----------------
+                print('[auto_fill] Iniciando fluxo de prints do site público...')
+                try:
+                    # Link do site no admin bar (href == domínio)
+                    site_link = None
+                    hrefs_to_try = [
+                        dominio.rstrip('/'),
+                        dominio.rstrip('/') + '/',
+                        (('http://' + dominio.split('://')[-1]).rstrip('/')),
+                        (('https://' + dominio.split('://')[-1]).rstrip('/')),
+                    ]
+                    for href_try in hrefs_to_try:
+                        try:
+                            site_link = WebDriverWait(driver, 10).until(
+                                EC.element_to_be_clickable((By.CSS_SELECTOR, f'a.ab-item[href^="{href_try}"]'))
+                            )
+                            if site_link:
+                                break
+                        except TimeoutException:
+                            continue
+                    if not site_link:
+                        # Fallback: procurar primeiro ab-item que aponte para root do domínio
+                        links = driver.find_elements(By.CSS_SELECTOR, 'a.ab-item')
+                        for lk in links:
+                            try:
+                                href = (lk.get_attribute('href') or '').rstrip('/')
+                                if any(href.startswith(h) for h in hrefs_to_try):
+                                    site_link = lk
+                                    break
+                            except Exception:
+                                continue
+                    if not site_link:
+                        raise RuntimeError('Link do site no admin bar não encontrado.')
+                    driver.execute_script('arguments[0].click();', site_link)
+                except Exception as e:
+                    print(f'[auto_fill] Falha ao navegar para o site público: {e}')
+                    raise
+
+                # Aguarda home carregar e tira screenshot -> Página Home
+                try:
+                    WebDriverWait(driver, 15).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, 'body, html'))
+                    )
+                except TimeoutException:
+                    pass
+                home_dir = os.path.dirname(out_img)
+                domain_slug = re.sub(r'[^a-zA-Z0-9]+', '_', dominio)
+                home_path = os.path.join(home_dir, f'home_{domain_slug}_{int(time.time())}.png')
+                driver.save_screenshot(home_path)
+                try:
+                    self.entry_pagina_home.delete(0, tk.END)
+                    self.entry_pagina_home.insert(0, home_path)
+                except Exception:
+                    pass
+                print(f'[auto_fill] Home screenshot: {home_path}')
+
+                # Helper para navegar por menus e printar
+                def go_and_shoot(link_text_candidates, out_filename_prefix, gui_entry_widget):
+                    selectors = [
+                        'nav a', 'header a', 'ul.menu a', 'a', 'footer a'
+                    ]
+                    found_link = None
+                    for txt in link_text_candidates:
+                        lowered = txt.lower()
+                        try:
+                            found_link = WebDriverWait(driver, 5).until(
+                                EC.element_to_be_clickable((By.XPATH, f"//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÂÊÔÃÕÇ', 'abcdefghijklmnopqrstuvwxyzáéíóúâêôãõç'), '{lowered}')]"))
+                            )
+                            if found_link:
+                                break
+                        except TimeoutException:
+                            pass
+                        for sel in selectors:
+                            try:
+                                links = driver.find_elements(By.CSS_SELECTOR, sel)
+                                for lk in links:
+                                    try:
+                                        t = (lk.text or '').strip().lower()
+                                        if lowered in t and lk.is_displayed():
+                                            found_link = lk
+                                            break
+                                    except Exception:
+                                        continue
+                                if found_link:
+                                    break
+                            except Exception:
+                                continue
+                        if found_link:
+                            break
+                    if not found_link:
+                        print(f"[auto_fill] Link não encontrado para: {link_text_candidates}")
+                        return None
+                    try:
+                        driver.execute_script('arguments[0].click();', found_link)
+                    except Exception:
+                        found_link.click()
+                    try:
+                        WebDriverWait(driver, 15).until(
+                            EC.presence_of_element_located((By.CSS_SELECTOR, 'body, html'))
+                        )
+                    except TimeoutException:
+                        pass
+                    out_path = os.path.join(home_dir, f'{out_filename_prefix}_{domain_slug}_{int(time.time())}.png')
+                    driver.save_screenshot(out_path)
+                    try:
+                        gui_entry_widget.delete(0, tk.END)
+                        gui_entry_widget.insert(0, out_path)
+                    except Exception:
+                        pass
+                    print(f'[auto_fill] {out_filename_prefix} screenshot: {out_path}')
+                    return out_path
+
+                # Quem somos / Sobre nós
+                go_and_shoot([
+                    'Quem somos', 'Quem Somos', 'Sobre nós', 'Sobre', 'About'
+                ], 'quem_somos', self.entry_pagina_quem_somos)
+
+                # Contato
+                go_and_shoot([
+                    'Contato', 'Contact'
+                ], 'contato', self.entry_pagina_contato)
+
+                # Produtos / Loja
+                go_and_shoot([
+                    'Produtos', 'Loja', 'Shop', 'Catálogo'
+                ], 'produtos', self.entry_pagina_produtos)
+
+                # Volta para o painel (wp-admin)
+                driver.get(dominio.rstrip('/') + '/wp-admin/')
+                WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, 'adminmenumain')))
+
+                # Produtos -> Todos os produtos
+                products_link = None
+                try:
+                    products_link = WebDriverWait(driver, 10).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, "#menu-posts-product a[href*='edit.php?post_type=product']"))
+                    )
+                except TimeoutException:
+                    try:
+                        products_link = WebDriverWait(driver, 10).until(
+                            EC.element_to_be_clickable((By.XPATH, "//div[@id='adminmenumain']//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÂÊÔÃÕÇ', 'abcdefghijklmnopqrstuvwxyzáéíóúâêôãõç'),'produtos') or contains(@href, 'edit.php?post_type=product')]"))
+                        )
+                    except TimeoutException:
+                        products_link = None
+                if products_link:
+                    driver.execute_script('arguments[0].click();', products_link)
+                    try:
+                        WebDriverWait(driver, 15).until(
+                            EC.presence_of_element_located((By.CSS_SELECTOR, '#wpbody-content'))
+                        )
+                    except TimeoutException:
+                        pass
+                    todos_produtos_path = os.path.join(home_dir, f'todos_produtos_{domain_slug}_{int(time.time())}.png')
+                    driver.save_screenshot(todos_produtos_path)
+                    try:
+                        self.entry_todos_produtos.delete(0, tk.END)
+                        self.entry_todos_produtos.insert(0, todos_produtos_path)
+                    except Exception:
+                        pass
+                    print(f'[auto_fill] Todos os Produtos screenshot: {todos_produtos_path}')
+
+                # ----------------- FIM FLUXO 1 -----------------
+
+                # Menu Astra
+                astra = None
+                for xp in ["//a[contains(text(), 'Astra')]", "//li[contains(@class,'menu-top')]//a[contains(text(),'Astra')]", "//div[@id='adminmenumain']//a[contains(text(),'Astra')]"]:
+                    try:
+                        astra = driver.find_element(By.XPATH, xp)
+                        break
+                    except NoSuchElementException:
+                        continue
+                if not astra:
+                    raise RuntimeError('Menu Astra não encontrado')
+                driver.execute_script('arguments[0].click();', astra)
+                time.sleep(2)
+
+                # Personalizar
+                customize = None
+                for xp in ["//a[contains(text(), 'Personalizar')]", "//a[contains(text(),'Customize')]", "//a[contains(@href,'customize.php')]"]:
+                    try:
+                        customize = driver.find_element(By.XPATH, xp)
+                        break
+                    except NoSuchElementException:
+                        continue
+                if not customize:
+                    raise RuntimeError('Botão Personalizar não encontrado')
+                driver.execute_script('arguments[0].click();', customize)
+                WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.ID, 'customize-controls')))
+                time.sleep(5)
+
+                # Style Guide (botão com id 'astra-tour')
+                print('[auto_fill] Procurando botão Style Guide...')
+                style_btn = None
+                try:
+                    # Primeiro em default_content
+                    driver.switch_to.default_content()
+                    style_btn = WebDriverWait(driver, 20).until(
+                        EC.element_to_be_clickable((By.ID, 'astra-tour'))
+                    )
+                except TimeoutException:
+                    print('[auto_fill] Botão por ID não encontrado em 20s, tentando seletores alternativos...')
+                    # Tentar múltiplos seletores com WebDriverWait
+                    selectors = [
+                        'button#astra-tour',
+                        'button[name="astra-tour"]',
+                        'button[title="Style Guide"]',
+                        'button:has(.ast-style-guide-tooltip)',
+                        '.ast-style-guide',
+                        'button .ast-style-guide-tooltip',
+                        'div.ast-style-guide'  # Novo: possível contêiner geral
+                    ]
+                    found = None
+                    for sel in selectors:
+                        try:
+                            found = WebDriverWait(driver, 10).until(
+                                EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
+                            )
+                            if found:
+                                style_btn = found
+                                break
+                        except TimeoutException:
+                            continue
+                    # Se ainda não achou, tentar dentro de iframes
+                    if not style_btn:
+                        print('[auto_fill] Tentando localizar dentro de iframes...')
+                        try:
+                            iframes = driver.find_elements(By.TAG_NAME, 'iframe')
+                            for iframe in iframes:
+                                try:
+                                    driver.switch_to.frame(iframe)
+                                    for sel in selectors:
+                                        try:
+                                            found = WebDriverWait(driver, 5).until(
+                                                EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
+                                            )
+                                            if found:
+                                                style_btn = found
+                                                break
+                                        except TimeoutException:
+                                            continue
+                                    if style_btn:
+                                        break
+                                except Exception:
+                                    continue
+                                finally:
+                                    driver.switch_to.default_content()
+                        except Exception:
+                            driver.switch_to.default_content()
+                if not style_btn:
+                    raise RuntimeError('Botão Style Guide (astra-tour) não encontrado. Verifique se o Astra está ativo.')
+                print('[auto_fill] Botão encontrado, clicando...')
+                driver.execute_script('arguments[0].click();', style_btn)
+
+                # Aguardar painel Style Guide aparecer (obrigatório)
+                print('[auto_fill] Aguardando painel Style Guide (div.ast-styler-card)...')
+                panel_selectors = [
+                    'div.ast-styler-card',
+                    'div.ast-style-guide',  # Fallback para variações
+                    'div[class*="style-guide"]',  # Qualquer classe com "style-guide"
+                    'div[class*="styler"]'  # Qualquer classe com "styler"
+                ]
+                panel_found = None
+                try:
+                    # Primeiro no default_content
+                    driver.switch_to.default_content()
+                    for sel in panel_selectors:
+                        try:
+                            panel_found = WebDriverWait(driver, 30).until(
+                                EC.presence_of_element_located((By.CSS_SELECTOR, sel))
+                            )
+                            print(f'[auto_fill] Painel encontrado com seletor: {sel}')
+                            break
+                        except TimeoutException:
+                            continue
+                    # Se não achou, tenta em iframes
+                    if not panel_found:
+                        print('[auto_fill] Painel não encontrado no default_content, tentando iframes...')
+                        iframes = driver.find_elements(By.TAG_NAME, 'iframe')
+                        for iframe in iframes:
+                            try:
+                                driver.switch_to.frame(iframe)
+                                for sel in panel_selectors:
+                                    try:
+                                        panel_found = WebDriverWait(driver, 10).until(
+                                            EC.presence_of_element_located((By.CSS_SELECTOR, sel))
+                                        )
+                                        print(f'[auto_fill] Painel encontrado em iframe com seletor: {sel}')
+                                        break
+                                    except TimeoutException:
+                                        continue
+                                if panel_found:
+                                    break
+                            except Exception:
+                                continue
+                            finally:
+                                driver.switch_to.default_content()
+                    if not panel_found:
+                        # Captura o HTML atual para depuração
+                        html = driver.page_source[:1000]  # Limita para não sobrecarregar
+                        messagebox.showerror('Erro', f'Painel Style Guide não apareceu (ast-styler-card). HTML parcial:\n{html}')
+                        raise RuntimeError('Painel Style Guide não apareceu a tempo. Verifique o tema Astra.')
+                except TimeoutException:
+                    html = driver.page_source[:1000]
+                    messagebox.showerror('Erro', f'Painel Style Guide não apareceu (ast-styler-card). HTML parcial:\n{html}')
+                    raise RuntimeError('Painel Style Guide não apareceu a tempo. Verifique o tema Astra.')
+
+                # Screenshot do Style Guide
+                print('[auto_fill] Capturando screenshot do Style Guide...')
+                ok = driver.save_screenshot(out_img)
+                if not ok:
+                    raise RuntimeError('Falha ao salvar screenshot')
+                print(f'[auto_fill] Screenshot salvo: {out_img}')
+
+                # Fechar o customizer (voltar para o site) e tirar print da Home
+                try:
+                    close_btn = WebDriverWait(driver, 10).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, 'a.customize-controls-close'))
+                    )
+                except TimeoutException:
+                    print('[auto_fill] Botão close não encontrado por CSS, tentando XPath...')
+                    try:
+                        close_btn = WebDriverWait(driver, 5).until(
+                            EC.element_to_be_clickable((By.XPATH, "//a[contains(@class, 'customize-controls-close')]"))
+                        )
+                    except TimeoutException:
+                        close_btn = None
+                if close_btn:
+                    print('[auto_fill] Fechando customizer...')
+                    driver.execute_script('arguments[0].click();', close_btn)
+                else:
+                    print('[auto_fill] Botão close não encontrado, continuando...')
+
+                # Tentar encontrar a página Home
+                print('[auto_fill] Aguardando página Home...')
+                home_selectors = [
+                    'div.hfeed.site',
+                    'div.site-container',  # Fallback para outros temas
+                    'body.home',  # Fallback genérico
+                    'div#page'  # Container comum no WordPress
+                ]
+                home_found = None
+                try:
+                    driver.switch_to.default_content()
+                    for sel in home_selectors:
+                        try:
+                            home_found = WebDriverWait(driver, 10).until(
+                                EC.presence_of_element_located((By.CSS_SELECTOR, sel))
+                            )
+                            print(f'[auto_fill] Página Home encontrada com seletor: {sel}')
+                            break
+                        except TimeoutException:
+                            continue
+                    if not home_found:
+                        html = driver.page_source[:1000]
+                        messagebox.showerror('Erro', f'Página Home não encontrada (hfeed site). HTML parcial:\n{html}')
+                        raise RuntimeError('Página Home não encontrada. Verifique o tema ou estrutura do site.')
+                except TimeoutException:
+                    html = driver.page_source[:1000]
+                    messagebox.showerror('Erro', f'Página Home não encontrada (hfeed site). HTML parcial:\n{html}')
+                    raise RuntimeError('Página Home não encontrada. Verifique o tema ou estrutura do site.')
+
+                # Salvar screenshot da Home
+                print('[auto_fill] Capturando screenshot da Home...')
+                home_dir = os.path.dirname(out_img)
+                home_path = os.path.join(home_dir, os.path.basename(out_img).replace('style_guide_', 'home_'))
+                driver.save_screenshot(home_path)
+                try:
+                    self.entry_pagina_home.delete(0, tk.END)
+                    self.entry_pagina_home.insert(0, home_path)
+                except Exception:
+                    pass
+                print(f'[auto_fill] Screenshot da Home salvo: {home_path}')
+
+                messagebox.showinfo('Sucesso', f'Style Guide: {out_img}\nPágina Home: {home_path}')
+            except (WebDriverException, TimeoutException) as e:
+                messagebox.showerror('Erro', f'Falha na automação: {e}')
+            except Exception as e:
+                messagebox.showerror('Erro', str(e))
+            finally:
+                if driver:
+                    driver.quit()
 
         def run(self):
             template = self.entry_template.get().strip()
@@ -528,8 +1228,28 @@ if TKINTER_AVAILABLE:
             else:
                 mapping["DOMINIOWP"] = ""
             mapping["DEMANDA"] = self.entry_demanda.get().strip()
+            mapping["EMAIL_CRIADO"] = self.entry_email_criado.get().strip()
+            # Hospedagem
+            hospedagem_list = []
+            if self.hostinger_var.get():
+                hospedagem_list.append("HOSTINGER")
+            if self.localweb_var.get():
+                hospedagem_list.append("LOCALWEB")
+            if self.uol_var.get():
+                hospedagem_list.append("UOL")
+            if hospedagem_list:
+                mapping["HOSPEDAGEM"] = ", ".join(hospedagem_list)
+            else:
+                mapping["HOSPEDAGEM"] = self.entry_hospedagem_custom.get().strip()
             mapping["IDENTIDADE_VISUAL_E_PALETA_DE_CORES"] = self.entry_identidade.get().strip()
-            mapping["ESPECIALISTARESPONSAVEL"] = "ITALO GOMES"
+            mapping["PAGINA_HOME_IMG"] = self.entry_pagina_home.get().strip()
+            mapping["PAGINA_PRODUTOS_IMG"] = self.entry_pagina_produtos.get().strip()
+            mapping["PAGINA_QUEM_SOMOS_IMG"] = self.entry_pagina_quem_somos.get().strip()
+            mapping["PAGINA_CONTATO_IMG"] = self.entry_pagina_contato.get().strip()
+            mapping["DETALHES_PEDIDO"] = self.entry_detalhes_pedido.get().strip()
+            mapping["DETALHES_PRODUTO"] = self.entry_detalhes_produto.get().strip()
+            mapping["TODOS_PRODUTOS"] = self.entry_todos_produtos.get().strip()
+            mapping["ESPECIALISTARESPONSAVEL"] = "ITALO FELIPE IGNACIO"
             drive = self.entry_drive.get().strip()
             if drive:
                 if not drive.startswith(('http://', 'https://')):
@@ -582,7 +1302,16 @@ def main():
     parser.add_argument("--data-entrega", help="Data de entrega [DATA_ENTREGA]")
     parser.add_argument("--dominio", help="Texto [DOMINIO]")
     parser.add_argument("--demanda", help="Texto [DEMANDA]")
+    parser.add_argument("--hospedagem", help="Texto [HOSPEDAGEM]")
+    parser.add_argument("--email-criado", help="Texto [EMAIL_CRIADO]")
     parser.add_argument("--identidade-visual", help="Caminho da imagem [IDENTIDADE_VISUAL_E_PALETA_DE_CORES]")
+    parser.add_argument("--pagina-home-img", help="Caminho da imagem [PAGINA_HOME_IMG]")
+    parser.add_argument("--pagina-produtos-img", help="Caminho da imagem [PAGINA_PRODUTOS_IMG]")
+    parser.add_argument("--pagina-quem-somos-img", help="Caminho da imagem [PAGINA_QUEM_SOMOS_IMG]")
+    parser.add_argument("--pagina-contato-img", help="Caminho da imagem [PAGINA_CONTATO_IMG]")
+    parser.add_argument("--detalhes-pedido", help="Caminho da imagem [DETALHES_PEDIDO]")
+    parser.add_argument("--detalhes-produto", help="Caminho da imagem [DETALHES_PRODUTO]")
+    parser.add_argument("--todos-produtos", help="Caminho da imagem [TODOS_PRODUTOS]")
     parser.add_argument("--run-tests", action="store_true", help="Executar testes rápidos")
     args = parser.parse_args()
     if args.run_tests:
@@ -602,6 +1331,13 @@ def main():
             print("replace_in_paragraph OK")
         except Exception as e:
             print("replace_in_paragraph falhou:", e)
+        # Teste da normalização de imagem
+        try:
+            test_path = "/path with spaces/image.jpg"
+            normalized = normalize_image_path(test_path)
+            print(f"normalize_image_path: '{test_path}' -> '{normalized}' OK")
+        except Exception as e:
+            print("normalize_image_path falhou:", e)
         return
     if TKINTER_AVAILABLE and not any([args.template, args.cnpj, args.drive]):
         root = tk.Tk()
@@ -614,7 +1350,16 @@ def main():
             "DATA_ENTREGA": args.data_entrega or "",
             "DOMINIO": args.dominio or "",
             "DEMANDA": args.demanda or "",
+            "HOSPEDAGEM": args.hospedagem or "",
+            "EMAIL_CRIADO": args.email_criado or "",
             "IDENTIDADE_VISUAL_E_PALETA_DE_CORES": args.identidade_visual or "",
+            "PAGINA_HOME_IMG": args.pagina_home_img or "",
+            "PAGINA_PRODUTOS_IMG": args.pagina_produtos_img or "",
+            "PAGINA_QUEM_SOMOS_IMG": args.pagina_quem_somos_img or "",
+            "PAGINA_CONTATO_IMG": args.pagina_contato_img or "",
+            "DETALHES_PEDIDO": args.detalhes_pedido or "",
+            "DETALHES_PRODUTO": args.detalhes_produto or "",
+            "TODOS_PRODUTOS": args.todos_produtos or "",
         }
         run_cli(
             template=args.template,
